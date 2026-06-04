@@ -339,15 +339,6 @@ input[type="datetime-local"]{-webkit-appearance:none;appearance:none;width:100%;
 .sync-badge.ok{color:#6be07a;}
 .sync-badge.warn{color:var(--accent);}
 .topbar .sync-badge{margin-left:auto;}
-/* AI入力UI */
-.ai-btn{background:none;border:1px solid var(--line);color:var(--fg-dim);font-family:var(--f-mono);font-size:10px;letter-spacing:0.08em;padding:5px 9px;border-radius:var(--r);cursor:pointer;margin-right:8px;transition:color 0.15s,border-color 0.15s;}
-.ai-btn:hover{color:var(--fg);border-color:var(--fg-dim);}
-.ai-list{min-height:140px;max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:4px 0 12px;margin-bottom:10px;}
-.ai-msg{max-width:88%;background:var(--bg-2);border:1px solid var(--line);border-radius:var(--r);padding:10px 14px;font-size:13px;line-height:1.7;align-self:flex-start;word-break:break-word;white-space:pre-wrap;}
-.ai-msg.ai-user{align-self:flex-end;background:var(--fg);color:var(--bg);border-color:transparent;}
-.ai-msg.ai-ok{border-color:var(--accent);}
-.ai-row{display:flex;gap:8px;align-items:center;}
-.ai-row .input{flex:1;min-width:0;}
 
 .fade{animation:fade .35s ease;}
 @keyframes fade{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
@@ -396,7 +387,6 @@ const CONFIG = {
     databaseURL: 'https://studymanager-v-default-rtdb.asia-southeast1.firebasedatabase.app',   // 例: 'https://xxxx-default-rtdb.firebaseio.com'
   },
   AUTH_KEY: 'studymanager.auth.v1',
-  AI_KEY:   'studymanager.ai.v1',          // Anthropic APIキーの保存キー（本体データとは完全に別管理）
   CLOUD_KEYS: ['profile','settings','subjects','materials','locations','records','goals'], // 同期対象（sessionは除外）
 
   PALETTE: [
@@ -618,127 +608,6 @@ const Cloud = {
 
 /* 変更フックを登録（ローカル専用時は scheduleSync が即return するので無害） */
 Store.setOnCommit(()=>Cloud.scheduleSync());
-
-/* ====================================================================== *
- *  [AI]  Claude による自然言語入力（Anthropic API / fetch のみ・SDK不使用）
- *  - APIキーはこの端末の CONFIG.AI_KEY キーにのみ保存（サーバー送信なし）
- *  - 記録追加・目標追加・質問応答をサポート
- *  ※ ネットワークが遮断されるプレビューでは動作しない。GitHub Pages で確認すること。
- * ====================================================================== */
-const AI = {
-  history: [],    // 会話履歴（リロードまで保持・ページ内のみ）
-
-  apiKey(){ try{ return localStorage.getItem(CONFIG.AI_KEY)||''; }catch(e){ return ''; } },
-  saveKey(k){ try{ localStorage.setItem(CONFIG.AI_KEY, k.trim()); }catch(e){} },
-  clearKey(){ try{ localStorage.removeItem(CONFIG.AI_KEY); }catch(e){} },
-  enabled(){ return !!this.apiKey(); },
-
-  /* Anthropic API に送信 → JSON を解釈 → Store に反映 */
-  async send(userText){
-    const subs=Store.list('subjects').map(s=>({id:s.id,name:s.name}));
-    const mats=Store.list('materials').map(m=>({id:m.id,name:m.name,subjectId:m.subjectId}));
-    const locs=Store.list('locations').map(l=>({id:l.id,name:l.name}));
-    const system=`あなたはstudymanagerの学習記録アシスタントです。
-現在日時: ${new Date().toLocaleString('ja-JP')}
-登録済み科目: ${JSON.stringify(subs)}
-登録済み教材: ${JSON.stringify(mats)}
-登録済み場所: ${JSON.stringify(locs)}
-
-ユーザーの入力に応じて学習記録や目標を登録してください。
-必ずJSONのみで回答（説明文・バッククォート不要）:
-
-学習記録: {"type":"add_record","subjectId":"id","materialId":null,"locationId":null,"durationMinutes":60,"datetime":"YYYY-MM-DDTHH:mm","note":"","reply":"日本語の確認メッセージ"}
-目標追加: {"type":"add_goal","subjectId":"id","goalType":"time","targetHours":10,"targetCount":null,"unit":null,"deadline":null,"reply":"確認メッセージ"}
-質問・照会: {"type":"message","reply":"日本語の回答"}
-
-注意: datetime指定がなければ現在時刻を使用。科目名は部分一致で最も近いものを選ぶ。`;
-
-    const msgs=[...this.history, {role:'user', content:userText}];
-    const res=await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers:{'Content-Type':'application/json','x-api-key':this.apiKey(),'anthropic-version':'2023-06-01'},
-      body:JSON.stringify({model:'claude-haiku-4-5-20251001', max_tokens:512, system, messages:msgs})
-    });
-    if(!res.ok){ const e=await res.json(); throw new Error(e?.error?.message||'HTTP '+res.status); }
-    const d=await res.json();
-    const raw=(d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
-    this.history=[...msgs, {role:'assistant', content:raw}];
-    if(this.history.length>20) this.history=this.history.slice(-20);  // 最大10往復
-    return this._exec(raw);
-  },
-
-  /* JSONを解釈してStoreに書き込む */
-  _exec(raw){
-    let j; try{ j=JSON.parse(raw.replace(/```[\w]*\n?|```/g,'').trim()); }catch(e){ return {reply:raw}; }
-    const rep=j.reply||'';
-    if(j.type==='add_record'){
-      if(!j.subjectId||!Store.find('subjects',j.subjectId)) return {reply:'科目が見つかりませんでした。'+rep};
-      Store.add('records',{ id:U.uid(), subjectId:j.subjectId, materialId:j.materialId||null,
-        locationId:j.locationId||null, start:(j.datetime?new Date(j.datetime):new Date()).toISOString(),
-        durationSec:(parseInt(j.durationMinutes,10)||0)*60, note:j.note||'', createdAt:new Date().toISOString() });
-      return {reply:rep, done:true};
-    }
-    if(j.type==='add_goal'){
-      if(!j.subjectId||!Store.find('subjects',j.subjectId)) return {reply:'科目が特定できませんでした。'+rep};
-      const g={id:U.uid(), subjectId:j.subjectId, type:j.goalType==='progress'?'progress':'time',
-        createdAt:new Date().toISOString(), deadline:j.deadline||null};
-      if(g.type==='progress'){g.targetCount=j.targetCount||0;g.unit=j.unit||'';g.currentCount=0;}
-      else{g.targetHours=j.targetHours||0;}
-      Store.add('goals',g);
-      return {reply:rep, done:true};
-    }
-    return {reply:rep};
-  },
-
-  /* チャットモーダルを開く（APIキー未設定の場合は設定画面を先に表示） */
-  open(){ if(!this.enabled()){ this._keySetup(); return; }
-    const list=el('div',{class:'ai-list'});
-    function addMsg(text, isUser, isOk){
-      list.append(el('div',{class:'ai-msg'+(isUser?' ai-user':'')+(isOk?' ai-ok':''),text}));
-      list.scrollTop=99999;
-    }
-    // 直前の会話履歴を復元
-    this.history.forEach(m=>{
-      if(m.role==='user'){ addMsg(m.content,true); }
-      else{ try{ const j=JSON.parse(m.content.replace(/```[\w]*\n?|```/g,'').trim()); addMsg(j.reply||m.content,false); }catch(e){ addMsg(m.content,false); } }
-    });
-    const inp=el('input',{class:'input',type:'text',placeholder:'「数学を90分勉強した」など…'});
-    const btn=el('button',{class:'btn btn-accent',text:'送信'});
-    async function doSend(){
-      const t=(inp.value||'').trim(); if(!t) return;
-      addMsg(t,true); inp.value=''; btn.disabled=true; inp.disabled=true;
-      const dots=el('div',{class:'ai-msg',text:'…'}); list.append(dots); list.scrollTop=99999;
-      try{ const r=await AI.send(t); dots.remove(); addMsg(r.reply,false,r.done); if(r.done) App.renderMain(); }
-      catch(e){ dots.remove(); addMsg('⚠ '+(e.message||e),false); }
-      btn.disabled=false; inp.disabled=false; inp.focus();
-    }
-    btn.addEventListener('click',doSend);
-    inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){e.preventDefault();doSend();} });
-    Modal.open({title:'AI記入 ✦ CLAUDE', body:[
-      list,
-      el('div',{class:'ai-row'},[inp, btn]),
-      el('button',{class:'link-btn',style:'margin-top:8px;',text:'会話をクリア',onclick:()=>{ AI.history=[]; list.innerHTML=''; }}),
-      el('button',{class:'link-btn',style:'margin-top:4px;',text:'APIキーを変更',onclick:()=>{ Modal.close(); AI._keySetup(); }}),
-    ]});
-  },
-
-  /* APIキー入力画面 */
-  _keySetup(){
-    const kinp=el('input',{class:'input',type:'password',placeholder:'sk-ant-api...'});
-    const save=el('button',{class:'btn btn-accent btn-block btn-lg',text:'保存して始める',onclick:()=>{
-      const k=(kinp.value||'').trim();
-      if(!k.startsWith('sk-')){ toast('有効なAPIキーを入力してください（sk- で始まります）'); return; }
-      AI.saveKey(k); Modal.close(); AI.open();
-    }});
-    kinp.addEventListener('keydown',e=>{ if(e.key==='Enter') save.click(); });
-    Modal.open({title:'AI記入 — APIキー設定', body:[
-      el('p',{style:'font-size:12px;color:var(--fg-dim);line-height:1.8;margin-bottom:20px;',
-        text:'Anthropic APIキーを入力してください。キーはこの端末のlocalStorageのみに保存されます。console.anthropic.com から取得できます。'}),
-      el('div',{class:'field'},[el('label',{text:'ANTHROPIC API KEY'}), kinp]),
-      save,
-    ]});
-  },
-};
 
 /* ---------------- [UTIL] ---------------- */
 const U = {
@@ -1275,7 +1144,6 @@ const Manage = {
             ['テーマ（ダーク / ライト）',()=>this.theme()],
             ['プロフィール編集',()=>this.profile()],
             ['データを書き出し (JSON)',()=>this.exportData()],
-            ['AI記入（Claude連携）',()=>{ Modal.close(); AI.open(); }],
           ];
           // アカウント（クラウド同期）— 設定がある時だけ出す
           if(Auth.enabled()){
@@ -1598,10 +1466,9 @@ const App = {
     const topbar=el('div',{class:'topbar'},[
       el('div',{class:'brand'},[ el('div',{class:'glyph'}), el('div',{class:'name',text:'STUDYMGR'}) ]),
       el('span',{class:'sync-badge'}),
-      el('button',{class:'ai-btn',text:'✦ AI',onclick:()=>AI.open()}),
       el('button',{class:'avatar',text:avatarTxt,onclick:()=>Manage.open()}),
     ]);
-    const pctop=el('div',{class:'pc-topbar'},[ el('span',{class:'sync-badge'}), el('button',{class:'ai-btn',text:'✦ AI',onclick:()=>AI.open()}), el('button',{class:'avatar',text:avatarTxt,onclick:()=>Manage.open()}) ]);
+    const pctop=el('div',{class:'pc-topbar'},[ el('span',{class:'sync-badge'}), el('button',{class:'avatar',text:avatarTxt,onclick:()=>Manage.open()}) ]);
 
     const main=el('main',{class:'main',id:'main'});
     const contentCol=el('div',{class:'content-col'},[ pctop, main ]);
